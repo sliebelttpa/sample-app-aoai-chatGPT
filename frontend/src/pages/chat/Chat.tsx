@@ -38,6 +38,7 @@ import { QuestionInput } from "../../components/QuestionInput";
 import { ChatHistoryPanel } from "../../components/ChatHistory/ChatHistoryPanel";
 import { AppStateContext } from "../../state/AppProvider";
 import { useBoolean } from "@fluentui/react-hooks";
+import { uploadFile } from "../../api/api";
 
 const enum messageStatus {
   NotRunning = 'Not Running',
@@ -65,6 +66,9 @@ const Chat = () => {
   const [errorMsg, setErrorMsg] = useState<ErrorMessage | null>()
   const [logo, setLogo] = useState('')
   const [answerId, setAnswerId] = useState<string>('')
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [uploadMessage, setUploadMessage] = useState<string>('')
+  const [isUploading, setIsUploading] = useState<boolean>(false)
 
   const errorDialogContentProps = {
     type: DialogType.close,
@@ -126,6 +130,27 @@ const Chat = () => {
       setShowAuthMessage(true)
     } else {
       setShowAuthMessage(false)
+    }
+  }
+
+  const handleFileUpload = async () => {
+    if (!selectedFile) {
+      setUploadMessage('Please choose a file first.')
+      return
+    }
+
+    try {
+      setIsUploading(true)
+      setUploadMessage('Uploading...')
+
+      const result = await uploadFile(selectedFile)
+      setUploadMessage(`Upload successful: ${result.filename}`)
+      console.log('Upload result', result)
+    } catch (error: any) {
+      setUploadMessage(`Upload failed: ${error.message}`)
+      console.error(error)
+    } finally {
+      setIsUploading(false)
     }
   }
 
