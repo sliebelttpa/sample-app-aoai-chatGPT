@@ -1,10 +1,15 @@
 import copy
 import json
 import os
+import base64
 import logging
 import uuid
 import httpx
 import asyncio
+from datetime import (
+    datetime, 
+    timezone,
+)
 from quart import (
     Blueprint,
     Quart,
@@ -57,7 +62,53 @@ def create_app():
             raise e
     
     return app
+    
+# helper that reads authenticated user from request headers and returns values for file storage and retrieval
 
+def get_current_user():
+    user_id = request.headers.get("X-MS-CLIENT-PRINCIPAL-ID")
+    user_name = request.headers.get("X-MS-CLIENT-PRINCIPAL-NAME")
+    tenant_id = request.headers.get("X-MS-CLIENT-PRINCIPAL-ID-TOKEN-TID")
+
+    principal_header = request.headers.get("X-MS-CLIENT-PRINCIPAL")
+    if principal_header and not user_id:
+        try:
+            decoded = base64.b64decode(principal_header)
+            principal = json.loads(decoded)
+            claims = {
+                claim["typ"]: claim["val"]
+                for claim in principal.get("claims", [])
+            }
+
+            user_id = (
+                claims.get("http://schemas.microsoft.com/identity/claims/objectidentifier")
+                or claims.get("oid")
+                or user_id
+            )
+            user_name = (
+                claims.get("preferred_username")
+                or claims.get("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name")
+                or user_name
+                or "unknown"
+            )
+            tenant_id = (
+                claims.get("http://schemas.microsoft.com/identity/claims/tenantid")
+                or claims.get("tid")
+                or tenant_id
+                or os.getenv("AZURE_TENANT_ID")
+                or "unknown-tenant"
+            )
+        except Exception as e:
+            logging.warning(f"Failed to parse X-MS-CLIENT-PRINCIPAL header: {e}")
+
+    if not user_id:
+        return None
+
+    return {
+        "user_id": user_id,
+        "user_name": user_name or "unknown",
+        "tenant_id": tenant_id or os.getenv("AZURE_TENANT_ID") or "unknown-tenant"
+    }
 
 @bp.route("/")
 async def index():
@@ -76,6 +127,23 @@ async def favicon():
 @bp.route("/assets/<path:path>")
 async def assets(path):
     return await send_from_directory("static/assets", path)
+
+#adding test route to verify get_current_user
+
+@bp.route("/api/me", methods=["GET"])
+async def me():
+    user = get_current_user()
+
+    if not user:
+        return jsonify({
+            "authenticated": False,
+            "message": "No authenticated user found"
+        }), 401
+
+    return jsonify({
+        "authenticated": True,
+        "user": user
+    })
 
 
 # Debug settings
