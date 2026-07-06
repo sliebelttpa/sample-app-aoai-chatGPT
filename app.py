@@ -26,6 +26,8 @@ from azure.identity.aio import (
     DefaultAzureCredential,
     get_bearer_token_provider
 )
+from azure.storage.blob.aio import BlobServiceClient
+from werkzeug.utils import secure_filename
 from backend.auth.auth_utils import get_authenticated_user_details
 from backend.security.ms_defender_utils import get_msdefender_user_json
 from backend.history.cosmosdbservice import CosmosConversationClient
@@ -44,12 +46,15 @@ from backend.utils import (
 bp = Blueprint("routes", __name__, static_folder="static", template_folder="static")
 
 cosmos_db_ready = asyncio.Event()
-
+UPLOAD_CONTAINER_NAME = os.getenv("USER_UPLOAD_CONTAINER", "user-documents")
+AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
 
 def create_app():
     app = Quart(__name__)
     app.register_blueprint(bp)
     app.config["TEMPLATES_AUTO_RELOAD"] = True
+    app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_CONTENT_LENGTH", str(16 * 1024 * 1024)))
+
     
     @app.before_serving
     async def init():
@@ -110,6 +115,29 @@ def get_current_user():
         "tenant_id": tenant_id or os.getenv("AZURE_TENANT_ID") or "unknown-tenant"
     }
 
+#adding Blob Helper functions
+def get_blob_service_client():
+    if not AZURE_STORAGE_CONNECTION_STRING:
+        raise ValueError("AZURE_STORAGE_CONNECTION_STRING is not configured")
+    return BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+
+
+async def ensure_upload_container_exists():
+    blob_service_client = get_blob_service_client()
+    container_client = blob_service_client.get_container_client(UPLOAD_CONTAINER_NAME)
+
+    try:
+        await container_client.create_container()
+    except Exception:
+        pass
+
+    return container_client
+
+
+def build_user_blob_path(user, file_id, filename):
+    safe_name = secure_filename(filename)
+    return f"private/{user['user_id']}/{file_id}/original/{safe_name}"
+
 @bp.route("/")
 async def index():
     return await render_template(
@@ -145,6 +173,69 @@ async def me():
         "user": user
     })
 
+#adding upload route
+@bp.route("/api/files/upload", methods=["POST"])
+async def upload_file():
+    user = get_current_user()
+    if not user:
+        return jsonify({
+            "message": "User is not authenticated"
+        }), 401
+
+    if not AZURE_STORAGE_CONNECTION_STRING:
+        return jsonify({
+            "message": "Storage is not configured"
+        }), 500
+
+    files = await request.files
+    uploaded_file = files.get("file")
+
+    if not uploaded_file:
+        return jsonify({
+            "message": "No file provided"
+        }), 400
+
+    filename = uploaded_file.filename or "uploaded-file"
+    if not filename.strip():
+        return jsonify({
+            "message": "Filename is empty"
+        }), 400
+
+    file_id = str(uuid.uuid4())
+    blob_path = build_user_blob_path(user, file_id, filename)
+
+    try:
+        container_client = await ensure_upload_container_exists()
+        blob_client = container_client.get_blob_client(blob_path)
+
+        file_bytes = uploaded_file.read()
+
+        await blob_client.upload_blob(
+            file_bytes,
+            overwrite=True,
+            metadata={
+                "owner_id": user["user_id"],
+                "user_name": user["user_name"],
+                "file_id": file_id,
+                "original_filename": filename,
+                "uploaded_at": datetime.now(timezone.utc).isoformat()
+            }
+        )
+
+        return jsonify({
+            "message": "File uploaded successfully",
+            "file_id": file_id,
+            "filename": filename,
+            "blob_path": blob_path,
+            "user_id": user["user_id"]
+        }), 200
+
+    except Exception as e:
+        logging.exception("File upload failed")
+        return jsonify({
+            "message": "File upload failed",
+            "error": str(e)
+        }), 500
 
 # Debug settings
 DEBUG = os.environ.get("DEBUG", "false")
