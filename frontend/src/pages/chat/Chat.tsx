@@ -956,6 +956,26 @@ const Chat = () => {
                   dialogContentProps={errorDialogContentProps}
                   modalProps={modalProps}></Dialog>
               </Stack>
+              <Stack style={{ marginRight: '12px', minWidth: '220px' }}>
+                <input
+                  type="file"
+                  onChange={e => {
+                    const files = e.target.files
+                    if (files && files.length > 0) {
+                      setSelectedFile(files[0])
+                      setUploadMessage('')
+                    }
+                  }}
+                />
+                <button onClick={handleFileUpload} disabled={isUploading || !selectedFile} style={{ marginTop: '8px' }}>
+                  {isUploading ? 'Uploading...' : 'Upload file'}
+                </button>
+                {uploadMessage && (
+                  <div style={{ marginTop: '8px', fontSize: '12px' }}>
+                    {uploadMessage}
+                  </div>
+                )}
+              </Stack>
               <QuestionInput
                 clearOnSend
                 placeholder="Type a new question..."
