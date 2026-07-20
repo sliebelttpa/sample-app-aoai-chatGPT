@@ -16,6 +16,7 @@ from quart import (
     current_app,
 )
 
+from datetime import datetime, timezone
 from openai import AsyncAzureOpenAI
 from azure.identity.aio import (
     DefaultAzureCredential,
@@ -24,6 +25,7 @@ from azure.identity.aio import (
 from backend.auth.auth_utils import get_authenticated_user_details
 from backend.security.ms_defender_utils import get_msdefender_user_json
 from backend.history.cosmosdbservice import CosmosConversationClient
+from backend.history.blobarchiveservice import BlobArchiveService
 from backend.settings import (
     app_settings,
     MINIMUM_SUPPORTED_AZURE_OPENAI_PREVIEW_API_VERSION
@@ -40,6 +42,26 @@ bp = Blueprint("routes", __name__, static_folder="static", template_folder="stat
 
 cosmos_db_ready = asyncio.Event()
 
+def build_archive_record(user_id, conversation_id, user_message, assistant_message):
+    return {
+        "schemaVersion": "1.0",
+        "archivedAtUtc": datetime.now(timezone.utc).isoformat(),
+        "userId": user_id,
+        "conversationId": conversation_id,
+        "userMessage": {
+            "id": user_message.get("id"),
+            "role": user_message.get("role"),
+            "content": user_message.get("content"),
+            "createdAt": user_message.get("createdAt")
+        },
+        "assistantMessage": {
+            "id": assistant_message.get("id"),
+            "role": assistant_message.get("role"),
+            "content": assistant_message.get("content"),
+            "createdAt": assistant_message.get("createdAt"),
+            "context": assistant_message.get("context")
+        }
+    }
 
 def create_app():
     app = Quart(__name__)
@@ -55,9 +77,39 @@ def create_app():
             logging.exception("Failed to initialize CosmosDB client")
             app.cosmos_conversation_client = None
             raise e
+
+        try:
+            app.archive_service = await init_archive_service()
+        except Exception:
+            logging.exception("Failed to initialize archive service")
+            app.archive_service = None
+
+    @app.after_serving
+    async def shutdown():
+        if getattr(app, "archive_service", None):
+            await app.archive_service.close()
     
     return app
 
+async def init_archive_service():
+    archive_enabled = os.getenv("ARCHIVE_ENABLED", "false").lower() == "true"
+
+    if not archive_enabled:
+        logging.info("Archive service is disabled.")
+        return None
+
+    account_name = os.getenv("ARCHIVE_STORAGE_ACCOUNT_NAME")
+    container_name = os.getenv("ARCHIVE_STORAGE_CONTAINER_NAME")
+
+    if not account_name or not container_name:
+        logging.warning("Archive service settings are missing. Archiving will be disabled.")
+        return None
+
+    logging.info("Initializing Blob archive service...")
+    return BlobArchiveService(
+        account_name=account_name,
+        container_name=container_name
+    )
 
 @bp.route("/")
 async def index():
@@ -663,49 +715,58 @@ async def update_conversation():
     authenticated_user = get_authenticated_user_details(request_headers=request.headers)
     user_id = authenticated_user["user_principal_id"]
 
-    ## check request for conversation_id
     request_json = await request.get_json()
     conversation_id = request_json.get("conversation_id", None)
 
     try:
-        # make sure cosmos is configured
         if not current_app.cosmos_conversation_client:
             raise Exception("CosmosDB is not configured or not working")
 
-        # check for the conversation_id, if the conversation is not set, we will create a new one
         if not conversation_id:
             raise Exception("No conversation_id found")
 
-        ## Format the incoming message object in the "chat/completions" messages format
-        ## then write it to the conversation history in cosmos
         messages = request_json["messages"]
+
         if len(messages) > 0 and messages[-1]["role"] == "assistant":
             if len(messages) > 1 and messages[-2].get("role", None) == "tool":
-                # write the tool message first
                 await current_app.cosmos_conversation_client.create_message(
                     uuid=str(uuid.uuid4()),
                     conversation_id=conversation_id,
                     user_id=user_id,
                     input_message=messages[-2],
                 )
-            # write the assistant message
+
+            assistant_message = messages[-1]
+
             await current_app.cosmos_conversation_client.create_message(
-                uuid=messages[-1]["id"],
+                uuid=assistant_message["id"],
                 conversation_id=conversation_id,
                 user_id=user_id,
-                input_message=messages[-1],
+                input_message=assistant_message,
             )
+
+            user_message = next(
+                (msg for msg in reversed(messages) if msg.get("role") == "user"),
+                None
+            )
+
+            if user_message and getattr(current_app, "archive_service", None):
+                archive_record = build_archive_record(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    user_message=user_message,
+                    assistant_message=assistant_message
+                )
+                await current_app.archive_service.archive_chat_turn(archive_record)
         else:
             raise Exception("No bot messages found")
 
-        # Submit request to Chat Completions for response
         response = {"success": True}
         return jsonify(response), 200
 
     except Exception as e:
         logging.exception("Exception in /history/update")
         return jsonify({"error": str(e)}), 500
-
 
 @bp.route("/history/message_feedback", methods=["POST"])
 async def update_message():
